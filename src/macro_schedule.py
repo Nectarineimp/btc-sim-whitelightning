@@ -10,13 +10,12 @@ Sources:
   3. U.S. Federal Reserve SOMA / TGA Seasonality (April Tax Drain / Q4 Refunding)
 """
 
-import io
 from pathlib import Path
 import numpy as np
 import pandas as pd
 import requests
 
-from config import DATA_DIR, RAW_DIR, PROCESSED_DIR
+from config import RAW_DIR, PROCESSED_DIR
 
 
 def ensure_dirs():
@@ -61,7 +60,7 @@ def build_macro_schedule(
 ) -> pd.DataFrame:
     """
     Derives deterministic forward macro liquidity regimes from:
-      - The 65-month global debt refinancing harmonic wave
+      - The 65-month global debt refinancing harmonic wave (with 2.5-month transmission lag)
       - Federal Reserve / Treasury seasonal tax and refunding dynamics
     """
     ensure_dirs()
@@ -73,44 +72,46 @@ def build_macro_schedule(
         "date": dates
     })
 
-    # 1. Howell 65-Month Sovereign Debt Wave
-    # Anchored at October 2022 global cycle trough (t=0 -> cycle phase = -pi/2)
+    # 1. Howell 65-Month Sovereign Debt Wave (with 2.5-month / ~10-week transmission lag)
     t0 = pd.Timestamp(cycle_trough_anchor)
-    df["months_from_t0"] = (df["date"].dt.year - t0.year) * 12 + (df["date"].dt.month - t0.month)
+    raw_months = (df["date"].dt.year - t0.year) * 12 + (df["date"].dt.month - t0.month)
+    df["months_from_t0"] = raw_months - 2.5
+
     omega = 2.0 * np.pi / cycle_period_months
     phase_offset = -np.pi / 2.0  # Trough at t=0
 
-    # Cycle Level [-1, +1]
+    # Cycle Level: L(t) = sin(wt + phi)
     df["howell_cycle_level"] = np.sin(omega * df["months_from_t0"] + phase_offset)
-    # Cycle Momentum / Velocity (1st derivative dL/dt)
+    # 1st Derivative (Velocity): dL/dt = cos(wt + phi)
     df["howell_momentum"] = np.cos(omega * df["months_from_t0"] + phase_offset)
+    # 2nd Derivative (Acceleration): d²L/dt² = -sin(wt + phi)
+    df["howell_acceleration"] = -np.sin(omega * df["months_from_t0"] + phase_offset)
 
     # 2. Statutory Calendar Seasonality (Treasury Tax Drains vs Spending Injections)
-    # April (month 4) & May (month 5): Massive corporate/personal tax drains into TGA
-    # December (month 12): Global banking repo window dressing
-    # July-November (Q3/Q4): Treasury deficit outlays and reserve reinjection
     seasonal_liquidity_impact = {
-        1: -0.10, 2: -0.10, 3: 0.00, 4: -0.80, 5: -0.50, 6: 0.10,
-        7: 0.30,  8: 0.40,  9: 0.30, 10: 0.40, 11: 0.50, 12: -0.40
+        1: -0.25, 2: -0.15, 3: 0.00, 4: -0.85, 5: -0.55, 6: 0.10,
+        7: 0.35,  8: 0.45,  9: 0.15, 10: 0.45, 11: 0.40, 12: -0.45
     }
     df["seasonal_factor"] = df["date"].dt.month.map(seasonal_liquidity_impact)
 
     # 3. Composite Macro Liquidity Acceleration Vector (d²L/dt²)
-    # Combining the secular multi-year wave momentum with high-frequency fiscal seasonality
-    df["composite_impulse"] = df["howell_momentum"] + (0.35 * df["seasonal_factor"])
+    df["composite_impulse"] = (
+        0.55 * df["howell_acceleration"]
+        + 0.25 * df["howell_momentum"]
+        + 0.60 * df["seasonal_factor"]
+    )
 
     # 4. Deterministic Regime Assignment:
-    # +1: Liquidity Surge / Credit Expansion (Impulse > +0.25)
-    #  0: Neutral Consolidation (-0.25 <= Impulse <= +0.25)
-    # -1: Liquidity Contraction / Refinancing Drain (Impulse < -0.25)
+    # +1: Liquidity Surge / Credit Expansion (Impulse > +0.15)
+    #  0: Neutral Consolidation (-0.05 <= Impulse <= +0.15)
+    # -1: Liquidity Contraction / Refinancing Drain (Impulse < -0.05)
     conditions = [
-        df["composite_impulse"] > 0.25,
-        df["composite_impulse"] < -0.25
+        df["composite_impulse"] > 0.15,
+        df["composite_impulse"] < -0.05
     ]
     choices = [1, -1]
     df["liquidity_regime"] = np.select(conditions, choices, default=0)
 
-    # Human-readable regime description
     desc_map = {
         1: "Expansion (Credit Acceleration)",
         0: "Neutral (Chop / Consolidation)",
@@ -118,17 +119,20 @@ def build_macro_schedule(
     }
     df["regime_label"] = df["liquidity_regime"].map(desc_map)
 
-    # Save to processed directory
     out_file = PROCESSED_DIR / "macro_conditioning_schedule.csv"
     df.to_csv(out_file, index=False)
     print(f"\n[✓] Deterministic macro conditioning schedule built: {out_file}")
     print(f"    - Horizon: {start_month} through {df['month'].iloc[-1]} ({len(df)} months)")
     print(f"    - Howell Cycle Period: {cycle_period_months} months (Anchored: {cycle_trough_anchor})")
-    
+
     return df
 
 
 if __name__ == "__main__":
     schedule_df = build_macro_schedule(start_month="2026-11", horizon_months=60)
     print("\nFirst 18 Months of Derived Macro Liquidity States:")
-    print(schedule_df[["month", "howell_cycle_level", "composite_impulse", "liquidity_regime", "regime_label"]].head(18).to_string(index=False))
+    print(
+        schedule_df[
+            ["month", "howell_cycle_level", "composite_impulse", "liquidity_regime", "regime_label"]
+        ].head(18).to_string(index=False)
+    )

@@ -44,23 +44,13 @@ def extract_historical_blocks(df: pd.DataFrame, block_size: int = BLOCK_SIZE_DAY
 
 def get_macro_conditioning_schedule() -> dict[str, int]:
     """
-    Loads or generates the deterministic macro liquidity schedule.
-    Returns a lookup dictionary mapping month strings ('YYYY-MM') to regime integers:
-      +1: Credit / Liquidity Expansion
-       0: Neutral Consolidation
-      -1: Maturity / Tax Drain Contraction
+    Generates the deterministic macro liquidity schedule via macro_schedule.py.
     """
-    schedule_path = PROCESSED_DIR / "macro_conditioning_schedule.csv"
-    if not schedule_path.exists():
-        print("[*] Macro schedule not found. Generating via macro_schedule.py...")
-        from macro_schedule import build_macro_schedule
-        schedule_df = build_macro_schedule(
-            start_month="2026-11",
-            horizon_months=FORECAST_HORIZON_MONTHS
-        )
-    else:
-        schedule_df = pd.read_csv(schedule_path)
-
+    from macro_schedule import build_macro_schedule
+    schedule_df = build_macro_schedule(
+        start_month="2026-11",
+        horizon_months=FORECAST_HORIZON_MONTHS
+    )
     lookup = dict(zip(schedule_df["month"], schedule_df["liquidity_regime"]))
     return lookup
 

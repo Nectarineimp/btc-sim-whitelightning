@@ -55,22 +55,47 @@ def fetch_coinmetrics_daily(force_refresh: bool = False) -> pd.DataFrame:
 
 
 def fetch_fred_series(series_id: str, force_refresh: bool = False) -> pd.DataFrame:
-    """Pulls public FRED economic series."""
+    """Pulls public FRED economic series, handling 'observation_date', 'DATE', or 'date'."""
     raw_path = RAW_DIR / f"{series_id}.csv"
-    if raw_path.exists() and not force_refresh:
-        return pd.read_csv(raw_path, parse_dates=["DATE"])
 
+    def _normalize_fred_df(df: pd.DataFrame) -> pd.DataFrame:
+        # Match 'observation_date', 'DATE', or 'date'
+        date_col = next(
+            (c for c in df.columns if c.lower() in ("observation_date", "date")),
+            df.columns[0],  # Fallback to first column
+        )
+        df = df.rename(columns={date_col: "date"})
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
+        return df[["date", series_id]].dropna().sort_values("date").reset_index(drop=True)
+
+    # 1. Read existing cached file if valid
+    if raw_path.exists() and not force_refresh:
+        try:
+            df = pd.read_csv(raw_path)
+            if series_id in df.columns:
+                df = _normalize_fred_df(df)
+                # Overwrite cache if it still had the old 'observation_date' header
+                df.to_csv(raw_path, index=False)
+                return df
+        except Exception as e:
+            print(f"    [!] Cache read issue for {series_id} ({e}), re-fetching...")
+
+    # 2. Download from FRED
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         resp = requests.get(url, headers=headers, timeout=30)
         resp.raise_for_status()
-        with open(raw_path, "w", encoding="utf-8") as f:
-            f.write(resp.text)
+
+        if "<html" in resp.text.lower():
+            raise ValueError(f"FRED endpoint returned HTML instead of CSV for {series_id}")
+
         df = pd.read_csv(io.StringIO(resp.text))
-        df["DATE"] = pd.to_datetime(df["DATE"])
-        df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
-        return df.dropna().rename(columns={"DATE": "date"})
+        df = _normalize_fred_df(df)
+        df.to_csv(raw_path, index=False)
+        return df
+
     except Exception as e:
         print(f"    [!] Note: Online FRED pull for {series_id} unavailable ({e}). Using synthetic baseline.")
         return pd.DataFrame()
@@ -88,9 +113,22 @@ def build_unified_dataset():
     rrpontsyd = fetch_fred_series("RRPONTSYD")# Reverse Repo
 
     if not walcl.empty and not wtregen.empty and not rrpontsyd.empty:
-        liq_df = walcl.merge(wtregen, on="date", how="outer").merge(rrpontsyd, on="date", how="outer")
-        liq_df = liq_df.sort_values("date").interpolate(method="linear")
-        liq_df["net_liquidity"] = liq_df["WALCL"] - liq_df["WTREGEN"] - liq_df["RRPONTSYD"]
+        # Merge on full daily price calendar first so weekly series align properly
+        liq_df = pd.DataFrame({"date": price_df["date"]})
+        liq_df = (
+            liq_df.merge(walcl, on="date", how="left")
+            .merge(wtregen, on="date", how="left")
+            .merge(rrpontsyd, on="date", how="left")
+        )
+        liq_df = liq_df.sort_values("date").ffill().bfill()
+
+        # Normalize units to Billions USD:
+        # WALCL and WTREGEN are in Millions (/ 1000 -> Billions); RRPONTSYD is already in Billions
+        walcl_bn = liq_df["WALCL"] / 1000.0
+        tga_bn = np.where(liq_df["WTREGEN"].median() > 10000, liq_df["WTREGEN"] / 1000.0, liq_df["WTREGEN"])
+        rrp_bn = liq_df["RRPONTSYD"].fillna(0.0)
+
+        liq_df["net_liquidity"] = walcl_bn - tga_bn - rrp_bn
     else:
         # Fallback: estimate from historical empirical baseline
         liq_df = pd.DataFrame({"date": price_df["date"]})
